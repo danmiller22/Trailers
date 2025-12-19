@@ -1,6 +1,7 @@
 // main.ts (Deno Deploy)
-// Telegram webhook: POST /
-// В чат пишешь "H03036" => бот отвечает 1 фото (satellite) + ссылка.
+// Webhook: POST /
+// Сообщение "H03036" => 1 фото (satellite) + ссылка на точку.
+// Если SkyBitz выдаёт error 97 — бот отдаёт последнюю сохранённую точку из Deno KV.
 
 type TgUpdate = {
   update_id: number;
@@ -14,10 +15,22 @@ type SkybitzJson = {
   };
 };
 
-// КЭШ: чтобы не ловить SkyBitz error 97 (частые запросы)
-const SOFT_TTL_MS = 10 * 60_000; // 10 минут — отдаём кэш без обращения к SkyBitz
-const HARD_TTL_MS = 24 * 60 * 60_000; // 24 часа — “последняя известная точка” на крайний случай
-const cache = new Map<string, { ts: number; lat: number; lon: number; time?: string }>();
+type Env = {
+  TG_BOT_TOKEN: string;
+  SKYBITZ_BASE_URL: string;
+  SKYBITZ_USER: string;
+  SKYBITZ_PASS: string;
+  SKYBITZ_VERSION: string;
+};
+
+type Pos = { ts: number; lat: number; lon: number; time?: string };
+
+const kv = await Deno.openKv();
+
+// Не дёргать SkyBitz чаще этого (на один трейлер)
+const SKYBITZ_MIN_INTERVAL_MS = 10 * 60_000; // 10 минут
+// Если SkyBitz недоступен/97 — можно отдавать очень старую последнюю точку
+const MAX_STALE_MS = 30 * 24 * 60 * 60_000; // 30 дней
 
 Deno.serve(async (req) => {
   if (req.method === "GET") return new Response("OK", { status: 200 });
@@ -44,90 +57,76 @@ Deno.serve(async (req) => {
   if (!assetId) return new Response("OK", { status: 200 });
 
   try {
-    const pos = await getPositionWithCache(env, assetId);
-
-    if (!pos) {
-      await tgSendMessage(env, chatId, "SkyBitz ограничил частоту запросов. Попробуй позже.");
+    // 1) Сначала смотрим KV: если свежо — отдаём сразу, SkyBitz не трогаем
+    const cached = await kvGetPos(assetId);
+    const now = Date.now();
+    if (cached && now - cached.ts < SKYBITZ_MIN_INTERVAL_MS) {
+      await sendPos(env, chatId, assetId, cached);
       return new Response("OK", { status: 200 });
     }
 
-    const { lat, lon } = pos;
-    const mapsLink = googleMapsSatelliteLink(lat, lon);
-    const imgUrl = esriWorldImageryStatic(lat, lon, 18, 900, 600);
+    // 2) Пробуем SkyBitz (если env не задан — сообщим)
+    ensureEnv(env);
 
-    await tgSendPhoto(env, chatId, imgUrl, `${assetId}\n${mapsLink}`);
-  } catch (e) {
-    // тут уже не молчим — покажем причину
-    await tgSendMessage(env, chatId, `Ошибка: ${String((e as any)?.message ?? e)}`);
-  }
-
-  return new Response("OK", { status: 200 });
-});
-
-// ---------- ENV ----------
-
-type Env = {
-  TG_BOT_TOKEN: string;
-  SKYBITZ_BASE_URL: string;
-  SKYBITZ_USER: string;
-  SKYBITZ_PASS: string;
-  SKYBITZ_VERSION: string;
-};
-
-function getEnv(): Env {
-  return {
-    TG_BOT_TOKEN: Deno.env.get("TG_BOT_TOKEN") ?? "",
-    SKYBITZ_BASE_URL: Deno.env.get("SKYBITZ_BASE_URL") ?? "",
-    SKYBITZ_USER: Deno.env.get("SKYBITZ_USER") ?? "",
-    SKYBITZ_PASS: Deno.env.get("SKYBITZ_PASS") ?? "",
-    SKYBITZ_VERSION: Deno.env.get("SKYBITZ_VERSION") ?? "2.76",
-  };
-}
-
-function ensureEnv(env: Env) {
-  const miss: string[] = [];
-  if (!env.TG_BOT_TOKEN) miss.push("TG_BOT_TOKEN");
-  if (!env.SKYBITZ_BASE_URL) miss.push("SKYBITZ_BASE_URL");
-  if (!env.SKYBITZ_USER) miss.push("SKYBITZ_USER");
-  if (!env.SKYBITZ_PASS) miss.push("SKYBITZ_PASS");
-  if (miss.length) throw new Error(`Missing env: ${miss.join(", ")}`);
-}
-
-// ---------- SKYBITZ (с кэшем) ----------
-
-async function getPositionWithCache(env: Env, assetId: string) {
-  ensureEnv(env);
-
-  const now = Date.now();
-  const cached = cache.get(assetId);
-
-  // если недавно уже дергали — отдаём кэш
-  if (cached && now - cached.ts < SOFT_TTL_MS) return cached;
-
-  // иначе пробуем SkyBitz
-  try {
     const fresh = await fetchLatestFromSkybitz(env, assetId);
     if (fresh) {
-      cache.set(assetId, fresh);
-      return fresh;
+      await kvSetPos(assetId, fresh);
+      await sendPos(env, chatId, assetId, fresh);
+      return new Response("OK", { status: 200 });
     }
-  } catch (e) {
-    // если SkyBitz ограничил (97) — вернём last known, если есть
-    const msg = String((e as any)?.message ?? e);
-    if (msg.includes("SkyBitz error 97")) {
-      const c = cache.get(assetId);
-      if (c && now - c.ts < HARD_TTL_MS) return c;
-      return null; // кэша нет — пусть наверху покажет “лимит”
-    }
-    throw e;
-  }
 
-  // SkyBitz вернул пусто — пробуем старый кэш
-  if (cached && now - cached.ts < HARD_TTL_MS) return cached;
-  return null;
+    // 3) Если SkyBitz вернул пусто — попробуем старый KV
+    if (cached && now - cached.ts < MAX_STALE_MS) {
+      await sendPos(env, chatId, assetId, cached);
+      return new Response("OK", { status: 200 });
+    }
+
+    await tgSendMessage(env, chatId, "Нет данных по этому трейлеру.");
+    return new Response("OK", { status: 200 });
+  } catch (e) {
+    const msg = String((e as any)?.message ?? e);
+
+    // SkyBitz error 97: отдаём KV если есть
+    if (msg.includes("SkyBitz error 97")) {
+      const cached = await kvGetPos(assetId);
+      if (cached && Date.now() - cached.ts < MAX_STALE_MS) {
+        await sendPos(env, chatId, assetId, cached);
+        return new Response("OK", { status: 200 });
+      }
+      await tgSendMessage(env, chatId, "SkyBitz ограничил частоту. Попробуй позже.");
+      return new Response("OK", { status: 200 });
+    }
+
+    // Любая другая ошибка: тоже пытаемся отдать KV
+    const cached = await kvGetPos(assetId);
+    if (cached && Date.now() - cached.ts < MAX_STALE_MS) {
+      await sendPos(env, chatId, assetId, cached);
+      return new Response("OK", { status: 200 });
+    }
+
+    await tgSendMessage(env, chatId, `Ошибка: ${msg}`);
+    return new Response("OK", { status: 200 });
+  }
+});
+
+// ---------- KV helpers ----------
+
+function posKey(assetId: string) {
+  return ["pos", assetId] as const;
 }
 
-async function fetchLatestFromSkybitz(env: Env, assetId: string) {
+async function kvGetPos(assetId: string): Promise<Pos | null> {
+  const r = await kv.get<Pos>(posKey(assetId));
+  return r.value ?? null;
+}
+
+async function kvSetPos(assetId: string, pos: Pos) {
+  await kv.set(posKey(assetId), pos);
+}
+
+// ---------- SkyBitz ----------
+
+async function fetchLatestFromSkybitz(env: Env, assetId: string): Promise<Pos | null> {
   // most recent position: from/to не передаем
   // JSON: getJson=1
   const url = new URL("/QueryPositions", env.SKYBITZ_BASE_URL);
@@ -137,12 +136,11 @@ async function fetchLatestFromSkybitz(env: Env, assetId: string) {
   url.searchParams.set("version", env.SKYBITZ_VERSION);
   url.searchParams.set("getJson", "1");
 
-  const res = await fetch(url.toString(), { headers: { "Accept": "application/json" } });
+  const res = await fetch(url.toString(), { headers: { Accept: "application/json" } });
   if (!res.ok) throw new Error(`SkyBitz HTTP ${res.status}`);
 
   const data = (await res.json()) as SkybitzJson;
   const err = data?.skybitz?.error ?? 0;
-
   if (err && err !== 0) throw new Error(`SkyBitz error ${err}`);
 
   const gls = data?.skybitz?.gls;
@@ -153,38 +151,51 @@ async function fetchLatestFromSkybitz(env: Env, assetId: string) {
   const time = rec?.time;
 
   if (typeof lat !== "number" || typeof lon !== "number") return null;
-
   return { ts: Date.now(), lat, lon, time };
 }
 
-// ---------- TELEGRAM ----------
+// ---------- Telegram output ----------
+
+async function sendPos(env: Env, chatId: number, assetId: string, pos: Pos) {
+  const mapsLink = googleMapsSatelliteLink(pos.lat, pos.lon);
+  const imgUrl = esriWorldImageryStatic(pos.lat, pos.lon, 18, 900, 600);
+  await tgSendPhoto(env, chatId, imgUrl, `${assetId}\n${mapsLink}`);
+}
 
 async function tgSendMessage(env: Env, chatId: number, text: string) {
   if (!env.TG_BOT_TOKEN) return;
-
   const url = new URL(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendMessage`);
-  await fetch(url.toString(), {
+  const r = await fetch(url.toString(), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true }),
   });
+  if (!r.ok) console.error("Telegram sendMessage failed", r.status, await safeText(r));
 }
 
 async function tgSendPhoto(env: Env, chatId: number, photoUrl: string, caption?: string) {
   if (!env.TG_BOT_TOKEN) return;
-
   const url = new URL(`https://api.telegram.org/bot${env.TG_BOT_TOKEN}/sendPhoto`);
   const payload: Record<string, unknown> = { chat_id: chatId, photo: photoUrl };
   if (caption) payload.caption = caption;
 
-  await fetch(url.toString(), {
+  const r = await fetch(url.toString(), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
+  if (!r.ok) console.error("Telegram sendPhoto failed", r.status, await safeText(r));
 }
 
-// ---------- MAPS ----------
+async function safeText(r: Response) {
+  try {
+    return await r.text();
+  } catch {
+    return "";
+  }
+}
+
+// ---------- Maps ----------
 
 function googleMapsSatelliteLink(lat: number, lon: number) {
   return `https://www.google.com/maps?q=${lat},${lon}&z=18&t=k`;
@@ -220,7 +231,26 @@ function lonLatToWebMercator(lon: number, lat: number): [number, number] {
   return [x, y];
 }
 
-// ---------- UTILS ----------
+// ---------- Env + utils ----------
+
+function getEnv(): Env {
+  return {
+    TG_BOT_TOKEN: Deno.env.get("TG_BOT_TOKEN") ?? "",
+    SKYBITZ_BASE_URL: Deno.env.get("SKYBITZ_BASE_URL") ?? "",
+    SKYBITZ_USER: Deno.env.get("SKYBITZ_USER") ?? "",
+    SKYBITZ_PASS: Deno.env.get("SKYBITZ_PASS") ?? "",
+    SKYBITZ_VERSION: Deno.env.get("SKYBITZ_VERSION") ?? "2.76",
+  };
+}
+
+function ensureEnv(env: Env) {
+  const miss: string[] = [];
+  if (!env.TG_BOT_TOKEN) miss.push("TG_BOT_TOKEN");
+  if (!env.SKYBITZ_BASE_URL) miss.push("SKYBITZ_BASE_URL");
+  if (!env.SKYBITZ_USER) miss.push("SKYBITZ_USER");
+  if (!env.SKYBITZ_PASS) miss.push("SKYBITZ_PASS");
+  if (miss.length) throw new Error(`Missing env: ${miss.join(", ")}`);
+}
 
 function sanitizeAssetId(s: string) {
   const t = s.trim();
